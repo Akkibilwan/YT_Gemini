@@ -7,7 +7,14 @@ import numpy as np
 from dateutil import parser
 import plotly.express as px
 
-# API Keys - Replace with your keys
+# Configure page
+st.set_page_config(
+    page_title="YouTube Trend Analyzer",
+    page_icon="📊",
+    layout="wide"
+)
+
+# API Keys
 YOUTUBE_API_KEY = "AIzaSyCUECZRXFkTkBvtO3g7jVcRxZDjit94ZWU"  # Replace with your YouTube API key
 GEMINI_API_KEY = "AIzaSyB3O8mJHTAMWQEKrJwGUaGLY7aDDVvRE0A"    # Replace with your Gemini API key
 
@@ -16,163 +23,181 @@ youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-pro')
 
-def get_channel_stats(channel_id):
-    """Get channel statistics for the past 3 months"""
+def get_video_details(video_id):
+    """Get detailed statistics for a specific video"""
     try:
-        # Get channel uploads playlist
-        channel_response = youtube.channels().list(
+        stats = youtube.videos().list(
+            part='statistics',
+            id=video_id
+        ).execute()
+        return stats['items'][0]['statistics'] if stats.get('items') else None
+    except Exception as e:
+        st.error(f"Error fetching video stats: {str(e)}")
+        return None
+
+def get_channel_recent_videos(channel_id):
+    """Get average views for channel's recent videos"""
+    try:
+        # Get channel's upload playlist
+        channel_data = youtube.channels().list(
             part='contentDetails',
             id=channel_id
         ).execute()
         
-        playlist_id = channel_response['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+        if not channel_data.get('items'):
+            return 0
+            
+        uploads_id = channel_data['items'][0]['contentDetails']['relatedPlaylists']['uploads']
         
-        # Get videos from the past 3 months
-        three_months_ago = (datetime.now() - timedelta(days=90)).isoformat() + 'Z'
-        
-        videos_response = youtube.playlistItems().list(
-            part='snippet',
-            playlistId=playlist_id,
-            maxResults=50
+        # Get recent videos
+        videos = youtube.playlistItems().list(
+            part='contentDetails',
+            playlistId=uploads_id,
+            maxResults=10
         ).execute()
         
-        video_ids = [item['snippet']['resourceId']['videoId'] 
-                    for item in videos_response.get('items', [])]
+        if not videos.get('items'):
+            return 0
+            
+        # Get view counts
+        video_ids = [item['contentDetails']['videoId'] for item in videos['items']]
+        views = []
         
-        # Get video statistics
-        stats_response = youtube.videos().list(
-            part='statistics',
-            id=','.join(video_ids)
-        ).execute()
-        
-        view_counts = [int(video['statistics']['viewCount']) 
-                      for video in stats_response['items']]
-        
-        return np.mean(view_counts) if view_counts else 0
-        
+        for vid_id in video_ids:
+            stats = get_video_details(vid_id)
+            if stats and 'viewCount' in stats:
+                views.append(int(stats['viewCount']))
+                
+        return np.mean(views) if views else 0
     except Exception as e:
         st.error(f"Error fetching channel stats: {str(e)}")
         return 0
 
-def calculate_outlier_score(avg_views, current_views):
-    """Calculate outlier score based on average views"""
-    if avg_views == 0:
-        return 0
-    
-    outlier_score = current_views / avg_views
-    # Round to nearest 0.1
-    return round(outlier_score * 10) / 10
-
-def search_videos(keyword, video_type='video'):
-    """Search for videos or shorts based on keyword"""
+def search_videos(keyword, content_type='video'):
+    """Search for videos based on keyword and type"""
     try:
-        # Use Gemini to understand and expand the keyword
-        prompt = f"Suggest relevant search terms for '{keyword}' in the context of YouTube {video_type}s"
+        # Use Gemini to enhance search
+        prompt = f"Generate 3 relevant YouTube search terms for: {keyword}"
         response = model.generate_content(prompt)
-        search_terms = response.text.split('\n')[:3]  # Take top 3 suggestions
+        search_terms = [keyword] + response.text.split('\n')[:2]
         
         all_videos = []
+        max_results = 30 if content_type == 'video' else 20
         
         for term in search_terms:
-            # Search for videos
             search_response = youtube.search().list(
                 q=term,
                 part='snippet',
                 type='video',
-                videoDefinition='high',
-                maxResults=50,
-                videoDuration='any' if video_type == 'video' else 'short'
+                videoDuration='any' if content_type == 'video' else 'short',
+                maxResults=max_results,
+                order='viewCount'
             ).execute()
             
             for item in search_response.get('items', []):
                 video_id = item['id']['videoId']
+                stats = get_video_details(video_id)
                 
-                # Get video statistics
-                video_stats = youtube.videos().list(
-                    part='statistics',
-                    id=video_id
-                ).execute()
-                
-                if not video_stats.get('items'):
+                if not stats:
                     continue
-                    
-                stats = video_stats['items'][0]['statistics']
+                
                 channel_id = item['snippet']['channelId']
-                
-                # Get channel average views
-                avg_channel_views = get_channel_stats(channel_id)
                 current_views = int(stats.get('viewCount', 0))
+                avg_views = get_channel_recent_videos(channel_id)
                 
-                outlier_score = calculate_outlier_score(avg_channel_views, current_views)
+                outlier_score = round((current_views / avg_views if avg_views > 0 else 0) * 10) / 10
                 
                 video_data = {
                     'title': item['snippet']['title'],
                     'thumbnail': item['snippet']['thumbnails']['high']['url'],
                     'channel': item['snippet']['channelTitle'],
                     'views': current_views,
+                    'likes': int(stats.get('likeCount', 0)),
+                    'comments': int(stats.get('commentCount', 0)),
                     'outlier_score': outlier_score,
-                    'video_id': video_id,
+                    'url': f"https://youtube.com/watch?v={video_id}",
                     'publish_date': parser.parse(item['snippet']['publishedAt']).strftime('%Y-%m-%d')
                 }
                 
                 all_videos.append(video_data)
         
-        # Sort by views and take top results
-        all_videos.sort(key=lambda x: x['views'], reverse=True)
-        return all_videos[:30 if video_type == 'video' else 20]
+        # Remove duplicates and sort
+        unique_videos = {v['url']: v for v in all_videos}.values()
+        return sorted(unique_videos, key=lambda x: x['views'], reverse=True)[:max_results]
         
     except Exception as e:
         st.error(f"Error searching videos: {str(e)}")
         return []
 
 def main():
-    st.title("YouTube Trend Analyzer")
+    st.title("📊 YouTube Trend Analyzer")
     
-    # Sidebar for inputs
+    # Sidebar
     with st.sidebar:
-        keyword = st.text_input("Enter keyword to search")
-        video_type = st.radio("Select content type", ['Videos', 'Shorts'])
+        st.header("Search Settings")
+        keyword = st.text_input("Enter keyword to search", placeholder="e.g., python programming")
+        content_type = st.radio("Content Type", ['Videos', 'Shorts'])
         
-        if st.button("Search"):
+        if st.button("🔍 Search", use_container_width=True):
             if keyword:
-                with st.spinner("Searching and analyzing..."):
-                    results = search_videos(keyword, video_type.lower())
-                    st.session_state.results = results
+                with st.spinner("Analyzing YouTube trends..."):
+                    results = search_videos(keyword, content_type.lower())
+                    if results:
+                        st.session_state.results = results
+                    else:
+                        st.error("No results found. Try a different keyword.")
             else:
                 st.warning("Please enter a keyword")
     
-    # Main content area
+    # Main content
     if 'results' in st.session_state and st.session_state.results:
-        results_df = pd.DataFrame(st.session_state.results)
+        results = st.session_state.results
         
-        # Display results in a grid
-        cols = st.columns(3)
-        for idx, video in enumerate(st.session_state.results):
-            with cols[idx % 3]:
-                st.image(video['thumbnail'], use_column_width=True)
-                st.write(f"**{video['title'][:50]}...**")
-                st.write(f"Channel: {video['channel']}")
-                st.write(f"Views: {video['views']:,}")
-                
-                # Color code outlier score
-                outlier_color = 'green' if video['outlier_score'] > 1.5 else \
-                              'orange' if video['outlier_score'] > 1.0 else 'red'
-                st.markdown(f"Outlier Score: <span style='color:{outlier_color}'>{video['outlier_score']}x</span>", 
-                          unsafe_allow_html=True)
-                st.write("---")
+        # Analytics Overview
+        st.header("📈 Analytics Overview")
+        col1, col2, col3 = st.columns(3)
         
-        # Add analytics section
-        st.header("Analytics")
+        with col1:
+            avg_views = np.mean([v['views'] for v in results])
+            st.metric("Average Views", f"{avg_views:,.0f}")
+            
+        with col2:
+            avg_outlier = np.mean([v['outlier_score'] for v in results])
+            st.metric("Average Outlier Score", f"{avg_outlier:.1f}x")
+            
+        with col3:
+            trending_channels = len(set([v['channel'] for v in results]))
+            st.metric("Trending Channels", trending_channels)
         
-        # Show distribution of outlier scores
-        st.subheader("Outlier Score Distribution")
-        fig = px.histogram(results_df, x='outlier_score', nbins=20)
-        st.plotly_chart(fig)
+        # Results Grid
+        st.header("🎥 Trending Content")
+        for i in range(0, len(results), 3):
+            cols = st.columns(3)
+            for j, col in enumerate(cols):
+                if i + j < len(results):
+                    video = results[i + j]
+                    with col:
+                        st.image(video['thumbnail'], use_column_width=True)
+                        st.markdown(f"**{video['title'][:50]}...**")
+                        st.write(f"Channel: {video['channel']}")
+                        st.write(f"Views: {video['views']:,}")
+                        
+                        # Color-coded outlier score
+                        color = 'green' if video['outlier_score'] > 1.5 else \
+                               'orange' if video['outlier_score'] > 1.0 else 'red'
+                        st.markdown(f"Outlier Score: <span style='color:{color}'>{video['outlier_score']}x</span>", 
+                                  unsafe_allow_html=True)
+                        
+                        st.markdown(f"[Watch Video]({video['url']})")
+                        st.divider()
         
-        # Show top channels by average views
-        st.subheader("Top Channels")
-        top_channels = results_df.groupby('channel')['views'].mean().sort_values(ascending=False).head(5)
-        st.bar_chart(top_channels)
+        # Distribution Plot
+        st.header("📊 Outlier Score Distribution")
+        df = pd.DataFrame(results)
+        fig = px.histogram(df, x='outlier_score', nbins=20,
+                          title='Distribution of Outlier Scores',
+                          labels={'outlier_score': 'Outlier Score', 'count': 'Number of Videos'})
+        st.plotly_chart(fig, use_container_width=True)
 
 if __name__ == "__main__":
     main()
