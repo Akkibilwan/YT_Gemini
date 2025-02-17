@@ -27,13 +27,22 @@ def get_video_details(video_id):
     """Get detailed statistics for a specific video"""
     try:
         stats = youtube.videos().list(
-            part='statistics',
+            part='statistics,contentDetails',
             id=video_id
         ).execute()
-        return stats['items'][0]['statistics'] if stats.get('items') else None
+        return stats['items'][0] if stats.get('items') else None
     except Exception as e:
         st.error(f"Error fetching video stats: {str(e)}")
         return None
+
+def parse_duration(duration):
+    """Convert YouTube duration format to seconds"""
+    import re
+    import isodate
+    try:
+        return int(isodate.parse_duration(duration).total_seconds())
+    except:
+        return 0
 
 def get_channel_recent_videos(channel_id):
     """Get average views for channel's recent videos"""
@@ -65,13 +74,21 @@ def get_channel_recent_videos(channel_id):
         
         for vid_id in video_ids:
             stats = get_video_details(vid_id)
-            if stats and 'viewCount' in stats:
-                views.append(int(stats['viewCount']))
+            if stats and 'statistics' in stats and 'viewCount' in stats['statistics']:
+                views.append(int(stats['statistics']['viewCount']))
                 
         return np.mean(views) if views else 0
     except Exception as e:
         st.error(f"Error fetching channel stats: {str(e)}")
         return 0
+
+def is_shorts(video_details):
+    """Determine if a video is a short based on duration and aspect ratio"""
+    if not video_details or 'contentDetails' not in video_details:
+        return False
+        
+    duration = parse_duration(video_details['contentDetails']['duration'])
+    return duration <= 60  # Shorts are typically 60 seconds or less
 
 def search_videos(keyword, content_type='video'):
     """Search for videos based on keyword and type"""
@@ -89,18 +106,23 @@ def search_videos(keyword, content_type='video'):
                 q=term,
                 part='snippet',
                 type='video',
-                videoDuration='any' if content_type == 'video' else 'short',
-                maxResults=max_results,
+                maxResults=50,  # Request more to account for filtering
                 order='viewCount'
             ).execute()
             
             for item in search_response.get('items', []):
                 video_id = item['id']['videoId']
-                stats = get_video_details(video_id)
+                video_details = get_video_details(video_id)
                 
-                if not stats:
+                if not video_details:
                     continue
                 
+                # Filter based on content type
+                is_short = is_shorts(video_details)
+                if (content_type == 'video' and is_short) or (content_type == 'shorts' and not is_short):
+                    continue
+                
+                stats = video_details['statistics']
                 channel_id = item['snippet']['channelId']
                 current_views = int(stats.get('viewCount', 0))
                 avg_views = get_channel_recent_videos(channel_id)
@@ -116,10 +138,14 @@ def search_videos(keyword, content_type='video'):
                     'comments': int(stats.get('commentCount', 0)),
                     'outlier_score': outlier_score,
                     'url': f"https://youtube.com/watch?v={video_id}",
-                    'publish_date': parser.parse(item['snippet']['publishedAt']).strftime('%Y-%m-%d')
+                    'publish_date': parser.parse(item['snippet']['publishedAt']).strftime('%Y-%m-%d'),
+                    'duration': parse_duration(video_details['contentDetails']['duration'])
                 }
                 
                 all_videos.append(video_data)
+                
+                if len(all_videos) >= max_results:
+                    break
         
         # Remove duplicates and sort
         unique_videos = {v['url']: v for v in all_videos}.values()
@@ -128,6 +154,16 @@ def search_videos(keyword, content_type='video'):
     except Exception as e:
         st.error(f"Error searching videos: {str(e)}")
         return []
+
+def format_duration(seconds):
+    """Format duration in seconds to MM:SS or HH:MM:SS"""
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
 
 def main():
     st.title("📊 YouTube Trend Analyzer")
@@ -181,6 +217,7 @@ def main():
                         st.markdown(f"**{video['title'][:50]}...**")
                         st.write(f"Channel: {video['channel']}")
                         st.write(f"Views: {video['views']:,}")
+                        st.write(f"Duration: {format_duration(video['duration'])}")
                         
                         # Color-coded outlier score
                         color = 'green' if video['outlier_score'] > 1.5 else \
